@@ -118,10 +118,12 @@ func (r *Registry) InitializeAll(ctx context.Context, logErr func(name string, e
 
 	var wg sync.WaitGroup
 	for _, name := range names {
-		// Fast-path read: skip servers that are already done or in progress.
+		// Fast-path read: skip servers that are already done, in progress, or
+		// permanently failed (initErr set means a previous attempt already ran and
+		// failed; callers must call RegisterConfig again to reset the entry).
 		r.mu.RLock()
 		entry, ok := r.servers[name]
-		skip := !ok || entry.ready || entry.initializing
+		skip := !ok || entry.ready || entry.initializing || entry.initErr != nil
 		r.mu.RUnlock()
 		if skip {
 			continue
@@ -132,7 +134,7 @@ func (r *Registry) InitializeAll(ctx context.Context, logErr func(name string, e
 		// initServer goroutines for the same server.
 		r.mu.Lock()
 		entry, ok = r.servers[name]
-		if !ok || entry.ready || entry.initializing {
+		if !ok || entry.ready || entry.initializing || entry.initErr != nil {
 			r.mu.Unlock()
 			continue
 		}
