@@ -1,6 +1,6 @@
 module github.com/ferro-labs/ai-gateway
 
-go 1.25.5
+go 1.25.5 // bumped from 1.25.0: github.com/mark3labs/mcp-go v0.54.0 requires go 1.25.5 in its own go.mod
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.5
