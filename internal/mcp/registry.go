@@ -28,9 +28,10 @@ type serverEntry struct {
 	config       ServerConfig
 	client       mcpClient
 	tools        []Tool
-	ready        bool  // true once Initialize + ListTools have succeeded
-	initializing bool  // true while initServer goroutine is running for this entry
-	initErr      error // last initialization error; nil when ready
+	ready        bool   // true once Initialize + ListTools have succeeded
+	initializing bool   // true while initServer goroutine is running for this entry
+	initErr      error  // last initialization error; nil when ready
+	generation   uint64 // incremented on each re-registration; guards against TOCTOU races
 }
 
 // NewRegistry creates an empty Registry.
@@ -71,6 +72,7 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 
 	var oldClient mcpClient
 	r.mu.Lock()
+	var nextGen uint64
 	if old, ok := r.servers[cfg.Name]; ok {
 		// Clean up only the toolMap entries that this server owned.
 		for _, t := range old.tools {
@@ -82,6 +84,9 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 		// on subprocess teardown; holding the write lock during that would stall
 		// all concurrent FindToolServer/AllTools/IsReady callers.
 		oldClient = old.client
+		// Bump the generation counter so any in-flight initServer goroutine
+		// for the old entry detects the replacement and aborts its commit.
+		nextGen = old.generation + 1
 		// Registration order and serverIndex are preserved on re-registration.
 	} else {
 		// First-time registration: assign a position in regOrder.
@@ -89,8 +94,9 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 		r.regOrder = append(r.regOrder, cfg.Name)
 	}
 	r.servers[cfg.Name] = &serverEntry{
-		config: cfg,
-		client: client,
+		config:     cfg,
+		client:     client,
+		generation: nextGen,
 	}
 	r.mu.Unlock()
 
@@ -157,6 +163,10 @@ func (r *Registry) InitializeAll(ctx context.Context, logErr func(name string, e
 func (r *Registry) initServer(ctx context.Context, name string) error {
 	r.mu.RLock()
 	entry, ok := r.servers[name]
+	var gen uint64
+	if ok {
+		gen = entry.generation
+	}
 	r.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("mcp: server %q not registered", name)
@@ -168,8 +178,10 @@ func (r *Registry) initServer(ctx context.Context, name string) error {
 	})
 	if err != nil {
 		r.mu.Lock()
-		entry.initErr = err
-		entry.initializing = false
+		if current, exists := r.servers[name]; exists && current.generation == gen {
+			entry.initErr = err
+			entry.initializing = false
+		}
 		r.mu.Unlock()
 		return fmt.Errorf("mcp init %s: %w", name, err)
 	}
@@ -180,8 +192,10 @@ func (r *Registry) initServer(ctx context.Context, name string) error {
 	})
 	if err != nil {
 		r.mu.Lock()
-		entry.initErr = err
-		entry.initializing = false
+		if current, exists := r.servers[name]; exists && current.generation == gen {
+			entry.initErr = err
+			entry.initializing = false
+		}
 		r.mu.Unlock()
 		return fmt.Errorf("mcp list tools %s: %w", name, err)
 	}
@@ -202,6 +216,14 @@ func (r *Registry) initServer(ctx context.Context, name string) error {
 	}
 
 	r.mu.Lock()
+	// Guard against a concurrent RegisterConfig that replaced r.servers[name]
+	// with a new entry while we were doing I/O. If the generation has changed,
+	// our results belong to a stale (orphaned) entry — bail out without touching
+	// the live map. The new entry will be initialized by the next InitializeAll.
+	if current, exists := r.servers[name]; !exists || current.generation != gen {
+		r.mu.Unlock()
+		return nil
+	}
 	// Remove stale toolMap entries from any previous indexing of this server.
 	// This handles re-registration — old tool→server mappings that are no
 	// longer valid must not linger in the map.
