@@ -58,6 +58,9 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 	var client mcpClient
 	if cfg.Command != "" {
 		client = newStdioClient(cfg.Command, cfg.Args, cfg.Env)
+	} else if cfg.URL == "" {
+		// Neither command nor URL — surface the error at InitializeAll time via errClient.
+		client = &errClient{err: fmt.Errorf("mcp server %q: either url (HTTP transport) or command (stdio transport) must be set", cfg.Name)}
 	} else {
 		timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 		if timeout <= 0 {
@@ -66,6 +69,7 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 		client = NewClient(cfg.URL, cfg.Headers, timeout)
 	}
 
+	var oldClient mcpClient
 	r.mu.Lock()
 	if old, ok := r.servers[cfg.Name]; ok {
 		// Clean up only the toolMap entries that this server owned.
@@ -74,10 +78,10 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 				delete(r.toolMap, t.Name)
 			}
 		}
-		// Close the old client (no-op for HTTP; terminates subprocess for stdio).
-		if old.client != nil {
-			_ = old.client.Close()
-		}
+		// Capture old client for close outside the lock — stdio Close() can block
+		// on subprocess teardown; holding the write lock during that would stall
+		// all concurrent FindToolServer/AllTools/IsReady callers.
+		oldClient = old.client
 		// Registration order and serverIndex are preserved on re-registration.
 	} else {
 		// First-time registration: assign a position in regOrder.
@@ -89,6 +93,13 @@ func (r *Registry) RegisterConfig(cfg ServerConfig) {
 		client: client,
 	}
 	r.mu.Unlock()
+
+	// Close the old client after releasing the lock (no-op for HTTP; terminates
+	// subprocess for stdio). Must run after Unlock so subprocess teardown does
+	// not stall the registry write lock.
+	if oldClient != nil {
+		_ = oldClient.Close()
+	}
 }
 
 // InitializeAll performs the MCP handshake and tool discovery for every

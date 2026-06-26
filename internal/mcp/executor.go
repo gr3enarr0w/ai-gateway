@@ -179,6 +179,7 @@ func (e *Executor) ResolvePendingToolCalls(ctx context.Context, resp *core.Respo
 			// Guard against hung subprocesses (stdio) or slow servers (HTTP).
 			callTimeout := e.registry.timeoutForServer(serverName)
 			toolCtx, cancelCall := context.WithTimeout(toolCtx, callTimeout)
+			defer cancelCall()
 
 			callStart := time.Now()
 			var result *ToolCallResult
